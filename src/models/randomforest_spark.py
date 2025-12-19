@@ -55,7 +55,7 @@ assembler = VectorAssembler(
 df_features = assembler.transform(df).select("features", label_col)
 
 # TRAIN / TEST SPLIT
-
+#Chia dữ liệu
 train_df, test_df = df_features.randomSplit([0.8, 0.2], seed=42)
 
 # RANDOM FOREST
