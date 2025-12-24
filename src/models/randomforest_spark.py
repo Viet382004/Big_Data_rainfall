@@ -73,7 +73,27 @@ model = rf.fit(train_df)
 training_time = time.time() - start_time
 
 print(f"Thời gian huấn luyện (Spark): {training_time:.2f} giây")
+# 1. Chuẩn bị đặc trưng
+feature_cols = ["location", "temp", "humidity", "wind", "pressure",
+                "day", "month", "year"]
 
+# 2. Vector Assembler để chuyển đổi sang định dạng Spark ML
+assembler = VectorAssembler(
+    inputCols=feature_cols,
+    outputCol="features",
+    handleInvalid="skip"
+)
+
+# 3. Mô hình Random Forest với các tham số
+rf = RandomForestRegressor(
+    featuresCol="features",
+    labelCol="rain",
+    numTrees=200,    # Số lượng cây trong rừng
+    minInstancesPerNode=2,    # Số mẫu tối thiểu trong nút lá
+    seed=42    # Random seed để tái lập kết quả
+)
+# Chia dữ liệu
+train_df, test_df = df_features.randomSplit(weights=[0.8, 0.2], seed=42)
 # PREDICT
 predictions = model.transform(test_df)
 
