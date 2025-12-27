@@ -1,127 +1,186 @@
 import os
+import json
+import joblib
 import findspark
-from pyspark.sql.functions import when
-
-findspark.init()
 
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import dayofmonth, month, year
 from pyspark.ml import Pipeline
-from pyspark.ml.feature import VectorAssembler, StandardScaler
+from pyspark.ml.feature import (
+    VectorAssembler,
+    StandardScaler,
+    StringIndexer,
+    OneHotEncoder
+)
 from pyspark.ml.regression import LinearRegression
 from pyspark.ml.evaluation import RegressionEvaluator
+
+findspark.init()
 
 
 def train_rainfall_model():
 
-    # Tạo SparkSession
+    # ==================================================
+    # 1. SPARK SESSION
+    # ==================================================
     spark = SparkSession.builder \
         .appName("RainfallLinearRegression") \
-        .config("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.RawLocalFileSystem") \
         .getOrCreate()
 
-    print("BẮT ĐẦU HUẤN LUYỆN MÔ HÌNH")
+    # ==================================================
+    # 2. LOAD DATA
+    # ==================================================
+    df = spark.read.csv(
+        "D:/SPARK/data/processed/rainfall_clean.csv",
+        header=True,
+        inferSchema=True
+    )
 
-    # Đọc dữ liệu
-    df = spark.read.csv("D:/SPARK/data/processed/rainfall_clean.csv", header=True, inferSchema=True)
+    # ==================================================
+    # 3. FEATURE ENGINEERING (DATE → DAY, MONTH, YEAR)
+    # ==================================================
+    df = df \
+        .withColumn("day", dayofmonth("date")) \
+        .withColumn("month", month("date")) \
+        .withColumn("year", year("date"))
 
-    # Tạo column features
-    numeric_cols = ["temperature_c", "humidity_pct", "wind_speed_kmh", "pressure_hpa"]
-    assembler = VectorAssembler(inputCols=numeric_cols, outputCol="features")
-    df_final = assembler.transform(df)
+    label_col = "rainfall_mm"
 
-    # Cấu hình training
-    feature_columns = numeric_cols
-    label_column = "rainfall_mm"
-    test_size = 0.2
-    seed = 42
-    scale = True
+    numeric_cols = [
+        "temperature_c",
+        "humidity_pct",
+        "wind_speed_kmh",
+        "pressure_hpa",
+        "day",
+        "month",
+        "year"
+    ]
 
-    # Chia dữ liệu
-    train_df, test_df = df_final.randomSplit([1 - test_size, test_size], seed=seed)
-    print(f"  Train: {train_df.count()} mẫu")
-    print(f"  Test : {test_df.count()} mẫu")
+    # ==================================================
+    # 4. LOCATION ENCODING
+    # ==================================================
+    location_indexer = StringIndexer(
+        inputCol="location",
+        outputCol="location_index",
+        handleInvalid="keep"
+    )
 
-    # Pipeline stages
-    stages = []
-    if scale:
-        scaler = StandardScaler(
-            inputCol="features",
-            outputCol="scaled_features",
-            withMean=True,
-            withStd=True
-        )
-        stages.append(scaler)
-        features_col = "scaled_features"
-    else:
-        features_col = "features"
+    location_encoder = OneHotEncoder(
+        inputCols=["location_index"],
+        outputCols=["location_ohe"]
+    )
 
-    # Linear Regression
+    # ==================================================
+    # 5. ASSEMBLE & SCALE
+    # ==================================================
+    assembler = VectorAssembler(
+        inputCols=numeric_cols + ["location_ohe"],
+        outputCol="features_raw"
+    )
+
+    scaler = StandardScaler(
+        inputCol="features_raw",
+        outputCol="features",
+        withMean=True,
+        withStd=True
+    )
+
+    # ==================================================
+    # 6. LINEAR REGRESSION (RIDGE)
+    # ==================================================
     lr = LinearRegression(
-        featuresCol=features_col,
-        labelCol=label_column,
-        solver="normal"
-    )
-    stages.append(lr)
-
-    pipeline = Pipeline(stages=stages)
-
-    # Huấn luyện
-    pipeline_model = pipeline.fit(train_df)
-    lr_model = pipeline_model.stages[-1]
-
-    # Dự đoán và đánh giá
-    predictions = pipeline_model.transform(test_df)
-    predictions_level = predictions.withColumn(
-        "rainfall_level",
-        when(predictions.prediction < 5, "Thấp")
-        .when((predictions.prediction >= 5) & (predictions.prediction <= 20), "Trung bình")
-        .otherwise("Cao")
+        featuresCol="features",
+        labelCol=label_col,
+        regParam=0.1,
+        elasticNetParam=0.0
     )
 
-    print("\n=== DỰ BÁO MỨC LƯỢNG MƯA ===")
-    predictions_level.select(
-        label_column,
-        "prediction",
-        "rainfall_level"
-    ).show(10, truncate=False)
+    pipeline = Pipeline(stages=[
+        location_indexer,
+        location_encoder,
+        assembler,
+        scaler,
+        lr
+    ])
 
-    evaluators = {
-        "RMSE": RegressionEvaluator(labelCol=label_column, metricName="rmse"),
-        "MAE": RegressionEvaluator(labelCol=label_column, metricName="mae"),
-        "R2": RegressionEvaluator(labelCol=label_column, metricName="r2")
+    # ==================================================
+    # 7. TRAIN / TEST SPLIT
+    # ==================================================
+    train_df, test_df = df.randomSplit([0.8, 0.2], seed=42)
+
+    # ==================================================
+    # 8. TRAIN MODEL
+    # ==================================================
+    model = pipeline.fit(train_df)
+
+    # ==================================================
+    # 9. EVALUATION
+    # ==================================================
+    pred_test = model.transform(test_df)
+
+    evaluator = RegressionEvaluator(
+        labelCol=label_col,
+        predictionCol="prediction"
+    )
+
+    metrics = {
+        "mse": evaluator.setMetricName("mse").evaluate(pred_test),
+        "rmse": evaluator.setMetricName("rmse").evaluate(pred_test),
+        "mae": evaluator.setMetricName("mae").evaluate(pred_test),
+        "r2": evaluator.setMetricName("r2").evaluate(pred_test)
     }
-    metrics = {}
-    for name, evaluator in evaluators.items():
-        value = evaluator.evaluate(predictions)
-        metrics[name] = value
 
-    # Thống kê
-    summary = lr_model.summary
-    importance = lr_model.coefficients.toArray().tolist()
+    lr_model = model.stages[-1]
+    scaler_model = model.stages[-2]
 
-    # Hiển thị kết quả
-    print("\n=== KẾT QUẢ HUẤN LUYỆN ===")
-    print("Metrics trên tập test:")
-    for k, v in metrics.items():
-        print(f"  {k}: {v:.4f}")
-    print(f"\nR² trên tập train: {summary.r2:.4f}")
-    print(f"RMSE trên tập train: {summary.rootMeanSquaredError:.4f}")
-    print(f"\nFeature importance: {importance}")
+    # ==================================================
+    # 10. SAVE MODEL PARAMS (CHO DEMO PYTHON / TKINTER)
+    # ==================================================
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(base_dir))
+    models_dir = os.path.join(project_root, "models")
+    os.makedirs(models_dir, exist_ok=True)
+
+    model_params = {
+        "coefficients": lr_model.coefficients.toArray().tolist()[:len(numeric_cols)],
+        "intercept": float(lr_model.intercept),
+        "feature_names": numeric_cols,
+        "scaler_mean": scaler_model.mean.toArray().tolist()[:len(numeric_cols)],
+        "scaler_std": scaler_model.std.toArray().tolist()[:len(numeric_cols)]
+    }
+
+    with open(
+        os.path.join(models_dir, "model_params.json"),
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(model_params, f, indent=2)
+
+    joblib.dump(
+        {k: round(v, 4) for k, v in metrics.items()},
+        os.path.join(models_dir, "metrics.pkl")
+    )
+
+    # ==================================================
+    # 11. PRINT (NGẮN – RÕ – ĐÚNG BÁO CÁO)
+    # ==================================================
+    print("\n📊 ĐÁNH GIÁ MÔ HÌNH (TEST)")
+    print(f"MSE : {metrics['mse']:.4f}")
+    print(f"RMSE: {metrics['rmse']:.4f}")
+    print(f"MAE : {metrics['mae']:.4f}")
+    print(f"R²  : {metrics['r2']:.4f}")
+
+    print("\n📐 HỆ SỐ HỒI QUY")
+    print(f"Intercept (β₀): {lr_model.intercept:.4f}")
+    for name, coef in zip(numeric_cols, lr_model.coefficients.toArray()):
+        print(f"β ({name}): {coef:.4f}")
 
     spark.stop()
-
-    return {
-        "pipeline_model": pipeline_model,
-        "linear_model": lr_model,
-        "predictions": predictions,
-        "metrics": metrics,
-        "feature_importance": importance
-    }
+    return model
 
 
 def main():
-    result = train_rainfall_model()
-    return result
+    train_rainfall_model()
 
 
 if __name__ == "__main__":
